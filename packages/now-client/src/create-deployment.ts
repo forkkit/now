@@ -1,12 +1,16 @@
 import { readdir as readRootFolder, lstatSync } from 'fs-extra';
 
 import readdir from 'recursive-readdir';
-import { relative, join } from 'path';
+import { relative, join, isAbsolute } from 'path';
 import hashes, { mapToObject } from './utils/hashes';
 import uploadAndDeploy from './upload';
-import { getNowIgnore, createDebug } from './utils';
+import { getNowIgnore, createDebug, parseNowJSON } from './utils';
 import { DeploymentError } from './errors';
-import { CreateDeploymentFunction, DeploymentOptions } from './types';
+import {
+  CreateDeploymentFunction,
+  DeploymentOptions,
+  NowJsonOptions,
+} from './types';
 
 export { EVENTS } from './utils';
 
@@ -15,9 +19,11 @@ export default function buildCreateDeployment(
 ): CreateDeploymentFunction {
   return async function* createDeployment(
     path: string | string[],
-    options: DeploymentOptions = {}
+    options: DeploymentOptions = {},
+    nowConfig?: NowJsonOptions
   ): AsyncIterableIterator<any> {
     const debug = createDebug(options.debug);
+    const cwd = process.cwd();
 
     debug('Creating deployment...');
 
@@ -47,6 +53,22 @@ export default function buildCreateDeployment(
 
     let rootFiles: string[];
 
+    if (Array.isArray(path)) {
+      for (const filePath of path) {
+        if (!isAbsolute(filePath)) {
+          throw new DeploymentError({
+            code: 'invalid_path',
+            message: `Provided path ${filePath} is not absolute`,
+          });
+        }
+      }
+    } else if (!isAbsolute(path)) {
+      throw new DeploymentError({
+        code: 'invalid_path',
+        message: `Provided path ${path} is not absolute`,
+      });
+    }
+
     if (isDirectory && !Array.isArray(path)) {
       debug(`Provided 'path' is a directory. Reading subpaths... `);
       rootFiles = await readRootFolder(path);
@@ -60,7 +82,7 @@ export default function buildCreateDeployment(
     }
 
     // Get .nowignore
-    let ig = await getNowIgnore(path);
+    let { ig, ignores } = await getNowIgnore(path);
 
     debug(`Found ${ig.ignores.length} rules in .nowignore`);
 
@@ -70,7 +92,7 @@ export default function buildCreateDeployment(
 
     if (isDirectory && !Array.isArray(path)) {
       // Directory path
-      const dirContents = await readdir(path);
+      const dirContents = await readdir(path, ignores);
       const relativeFileList = dirContents.map(filePath =>
         relative(process.cwd(), filePath)
       );
@@ -87,6 +109,47 @@ export default function buildCreateDeployment(
       // Single file
       fileList = [path];
       debug(`Deploying the provided path as single file`);
+    }
+
+    if (!nowConfig) {
+      // If the user did not provide a nowConfig,
+      // then use the now.json file in the root.
+      const fileName = 'now.json';
+      const absolutePath = fileList.find(f => relative(cwd, f) === fileName);
+      debug(absolutePath ? `Found ${fileName}` : `Missing ${fileName}`);
+      nowConfig = await parseNowJSON(absolutePath);
+    }
+
+    if (
+      version === 1 &&
+      nowConfig &&
+      Array.isArray(nowConfig.files) &&
+      nowConfig.files.length > 0
+    ) {
+      // See the docs: https://zeit.co/docs/v1/features/configuration/#files-(array)
+      debug('Filtering file list based on `files` key in now.json');
+      const allowedFiles = new Set<string>(['Dockerfile']);
+      const allowedDirs = new Set<string>();
+      nowConfig.files.forEach(relPath => {
+        if (lstatSync(relPath).isDirectory()) {
+          allowedDirs.add(relPath);
+        } else {
+          allowedFiles.add(relPath);
+        }
+      });
+      fileList = fileList.filter(absPath => {
+        const relPath = relative(cwd, absPath);
+        if (allowedFiles.has(relPath)) {
+          return true;
+        }
+        for (let dir of allowedDirs) {
+          if (relPath.startsWith(dir + '/')) {
+            return true;
+          }
+        }
+        return false;
+      });
+      debug(`Found ${fileList.length} files: ${JSON.stringify(fileList)}`);
     }
 
     // This is a useful warning because it prevents people
@@ -124,8 +187,13 @@ export default function buildCreateDeployment(
       force,
       defaultName,
       debug: debug_,
+      apiUrl,
       ...metadata
     } = options;
+
+    if (apiUrl) {
+      debug(`Using provided API URL: ${apiUrl}`);
+    }
 
     debug(`Setting platform version to ${version}`);
     metadata.version = version;
@@ -133,6 +201,7 @@ export default function buildCreateDeployment(
     const deploymentOpts = {
       debug: debug_,
       totalFiles: files.size,
+      nowConfig,
       token,
       isDirectory,
       path,
@@ -140,6 +209,7 @@ export default function buildCreateDeployment(
       force,
       defaultName,
       metadata,
+      apiUrl,
     };
 
     debug(`Creating the deployment and starting upload...`);

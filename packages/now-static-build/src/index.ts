@@ -1,8 +1,9 @@
+import ms from 'ms';
 import path from 'path';
 import spawn from 'cross-spawn';
 import getPort from 'get-port';
-import { timeout } from 'promise-timeout';
 import isPortReachable from 'is-port-reachable';
+import { ChildProcess, SpawnOptions } from 'child_process';
 import { existsSync, readFileSync, statSync, readdirSync } from 'fs';
 import { frameworks, Framework } from './frameworks';
 import {
@@ -17,6 +18,7 @@ import {
   getNodeVersion,
   getSpawnOptions,
   Files,
+  FileFsRef,
   Route,
   BuildOptions,
   Config,
@@ -25,11 +27,20 @@ import {
   PrepareCacheOptions,
 } from '@now/build-utils';
 
-async function checkForPort(port: number | undefined): Promise<void> {
+const sleep = (n: number) => new Promise(resolve => setTimeout(resolve, n));
+
+const DEV_SERVER_PORT_BIND_TIMEOUT = ms('5m');
+
+async function checkForPort(
+  port: number | undefined,
+  timeout: number
+): Promise<void> {
+  const start = Date.now();
   while (!(await isPortReachable(port))) {
-    await new Promise(resolve => {
-      setTimeout(resolve, 100);
-    });
+    if (Date.now() - start > timeout) {
+      throw new Error(`Detecting port ${port} timed out after ${ms(timeout)}`);
+    }
+    await sleep(100);
   }
 }
 
@@ -49,7 +60,7 @@ function validateDistDir(
   const docsUrl = `https://zeit.co/docs/v2/deployments/official-builders/static-build-now-static-build${hash}`;
 
   const info = config.zeroConfig
-    ? '\nMore details: https://zeit.co/docs/v2/advanced/platform/frequently-asked-questions#missing-public-directory'
+    ? '\nMore details: https://zeit.co/docs/v2/platform/frequently-asked-questions#missing-public-directory'
     : `\nMake sure you configure the the correct distDir: ${docsUrl}`;
 
   if (!exists()) {
@@ -92,7 +103,20 @@ function getCommand(pkg: PackageJson, cmd: string, { zeroConfig }: Config) {
 
 export const version = 2;
 
-const nowDevScriptPorts = new Map();
+const nowDevScriptPorts = new Map<string, number>();
+const nowDevChildProcesses = new Set<ChildProcess>();
+
+['SIGINT', 'SIGTERM'].forEach(signal => {
+  process.once(signal as NodeJS.Signals, () => {
+    for (const child of nowDevChildProcesses) {
+      debug(
+        `Got ${signal}, killing dev server child process (pid=${child.pid})`
+      );
+      process.kill(child.pid, signal);
+    }
+    process.exit(0);
+  });
+});
 
 const getDevRoute = (srcBase: string, devPort: number, route: Route) => {
   const basic: Route = {
@@ -126,6 +150,24 @@ async function getFrameworkRoutes(
   return routes;
 }
 
+function getPkg(entrypoint: string, workPath: string) {
+  if (path.basename(entrypoint) !== 'package.json') {
+    return null;
+  }
+
+  const pkgPath = path.join(workPath, entrypoint);
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as PackageJson;
+  return pkg;
+}
+
+function getFramework(pkg: PackageJson) {
+  const dependencies = Object.assign({}, pkg.dependencies, pkg.devDependencies);
+  const framework = frameworks.find(
+    ({ dependency }) => dependencies[dependency || '']
+  );
+  return framework;
+}
+
 export async function build({
   files,
   entrypoint,
@@ -145,11 +187,9 @@ export async function build({
     (config && (config.distDir as string)) || 'dist'
   );
 
-  const entrypointName = path.basename(entrypoint);
+  const pkg = getPkg(entrypoint, workPath);
 
-  if (entrypointName === 'package.json') {
-    const pkgPath = path.join(workPath, entrypoint);
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as PackageJson;
+  if (pkg) {
     const gemfilePath = path.join(workPath, 'Gemfile');
     const requirementsPath = path.join(workPath, 'requirements.txt');
 
@@ -207,15 +247,7 @@ export async function build({
       // `public` is the default for zero config
       distPath = path.join(workPath, path.dirname(entrypoint), 'public');
 
-      const dependencies = Object.assign(
-        {},
-        pkg.dependencies,
-        pkg.devDependencies
-      );
-
-      framework = frameworks.find(
-        ({ dependency }) => dependencies[dependency || '']
-      );
+      framework = getFramework(pkg);
     }
 
     if (framework) {
@@ -232,6 +264,10 @@ export async function build({
         debug(
           `${framework.name} does not require a specific Node.js version. Continuing ...`
         );
+      }
+
+      if (framework.beforeBuildHook) {
+        await framework.beforeBuildHook(entrypointDir);
       }
     }
 
@@ -256,32 +292,21 @@ export async function build({
         devPort = await getPort();
         nowDevScriptPorts.set(entrypoint, devPort);
 
-        const opts = {
+        const opts: SpawnOptions = {
           cwd: entrypointDir,
+          stdio: 'inherit',
           env: { ...process.env, PORT: String(devPort) },
         };
 
-        const child = spawn('yarn', ['run', devScript], opts);
+        const child: ChildProcess = spawn('yarn', ['run', devScript], opts);
         child.on('exit', () => nowDevScriptPorts.delete(entrypoint));
-        if (child.stdout) {
-          child.stdout.setEncoding('utf8');
-          child.stdout.pipe(process.stdout);
-        }
-        if (child.stderr) {
-          child.stderr.setEncoding('utf8');
-          child.stderr.pipe(process.stderr);
-        }
+        nowDevChildProcesses.add(child);
 
         // Now wait for the server to have listened on `$PORT`, after which we
         // will ProxyPass any requests to that development server that come in
         // for this builder.
         try {
-          await timeout(
-            new Promise(resolve => {
-              checkForPort(devPort).then(resolve);
-            }),
-            5 * 60 * 1000
-          );
+          await checkForPort(devPort, DEV_SERVER_PORT_BIND_TIMEOUT);
         } catch (err) {
           throw new Error(
             `Failed to detect a server running on port ${devPort}.\nDetails: https://err.sh/zeit/now/now-static-build-failed-to-detect-a-server`
@@ -365,7 +390,7 @@ export async function build({
     return { routes, watch, output, distPath };
   }
 
-  if (!config.zeroConfig && entrypointName.endsWith('.sh')) {
+  if (!config.zeroConfig && entrypoint.endsWith('.sh')) {
     debug(`Running build script "${entrypoint}"`);
     const nodeVersion = await getNodeVersion(entrypointDir, undefined, config);
     const spawnOpts = getSpawnOptions(meta, nodeVersion);
@@ -391,10 +416,27 @@ export async function build({
   throw new Error(message);
 }
 
-export async function prepareCache({ workPath }: PrepareCacheOptions) {
-  return {
-    ...(await glob('node_modules/**', workPath)),
-    ...(await glob('package-lock.json', workPath)),
-    ...(await glob('yarn.lock', workPath)),
-  };
+export async function prepareCache({
+  entrypoint,
+  workPath,
+}: PrepareCacheOptions) {
+  // default cache paths
+  const defaultCacheFiles = await glob(
+    '{node_modules/**,package-lock.json,yarn.lock}',
+    workPath
+  );
+
+  // framework specific cache paths
+  let frameworkCacheFiles: { [path: string]: FileFsRef } | null = null;
+
+  const pkg = getPkg(entrypoint, workPath);
+  if (pkg) {
+    const framework = getFramework(pkg);
+
+    if (framework && framework.cachePattern) {
+      frameworkCacheFiles = await glob(framework.cachePattern, workPath);
+    }
+  }
+
+  return { ...defaultCacheFiles, ...frameworkCacheFiles };
 }

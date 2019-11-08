@@ -1,15 +1,14 @@
 import { DeploymentFile } from './utils/hashes';
 import {
-  parseNowJSON,
   fetch,
-  API_DEPLOYMENTS,
   prepareFiles,
-  API_DEPLOYMENTS_LEGACY,
   createDebug,
+  getApiDeploymentsUrl,
 } from './utils';
 import checkDeploymentStatus from './deployment-status';
 import { generateQueryString } from './utils/query-string';
 import { Deployment, DeploymentOptions, NowJsonOptions } from './types';
+import { isReady, isAliasAssigned } from './utils/ready-state';
 
 export interface Options {
   metadata: DeploymentOptions;
@@ -22,6 +21,8 @@ export interface Options {
   defaultName?: string;
   preflight?: boolean;
   debug?: boolean;
+  nowConfig?: NowJsonOptions;
+  apiUrl?: string;
 }
 
 async function* createDeployment(
@@ -32,8 +33,7 @@ async function* createDeployment(
 ): AsyncIterableIterator<{ type: string; payload: any }> {
   const preparedFiles = prepareFiles(files, options);
 
-  let apiDeployments =
-    metadata.version === 2 ? API_DEPLOYMENTS : API_DEPLOYMENTS_LEGACY;
+  const apiDeployments = getApiDeploymentsUrl(metadata);
 
   debug('Sending deployment creation API request');
   try {
@@ -50,6 +50,7 @@ async function* createDeployment(
           ...metadata,
           files: preparedFiles,
         }),
+        apiUrl: options.apiUrl,
       }
     );
 
@@ -72,6 +73,10 @@ async function* createDeployment(
       if (name.startsWith('x-now-warning-')) {
         debug('Deployment created with a warning:', value);
         yield { type: 'warning', payload: value };
+      }
+      if (name.startsWith('x-now-notice-')) {
+        debug('Deployment created with a notice:', value);
+        yield { type: 'notice', payload: value };
       }
     }
 
@@ -108,32 +113,12 @@ export default async function* deploy(
   options: Options
 ): AsyncIterableIterator<{ type: string; payload: any }> {
   const debug = createDebug(options.debug);
-  delete options.debug;
-
-  debug(`Trying to read 'now.json'`);
-  const nowJson: DeploymentFile | undefined = Array.from(files.values()).find(
-    (file: DeploymentFile): boolean => {
-      return Boolean(
-        file.names.find((name: string): boolean => name.includes('now.json'))
-      );
-    }
-  );
-
-  debug(`'now.json' ${nowJson ? 'found' : "doesn't exist"}`);
-
-  const nowJsonMetadata: NowJsonOptions = parseNowJSON(nowJson);
-
+  const nowJsonMetadata = options.nowConfig || {};
   delete nowJsonMetadata.github;
   delete nowJsonMetadata.scope;
 
   const meta = options.metadata || {};
   const metadata = { ...nowJsonMetadata, ...meta };
-  if (nowJson) {
-    debug(
-      `Merged 'now.json' metadata and locally provided metadata:`,
-      JSON.stringify(metadata)
-    );
-  }
 
   // Check if we should default to a static deployment
   if (!metadata.version && !metadata.name) {
@@ -207,9 +192,12 @@ export default async function* deploy(
   }
 
   if (deployment) {
-    if (deployment.readyState === 'READY') {
-      debug('Deployment is READY. Not performing additional polling');
-      return yield { type: 'ready', payload: deployment };
+    if (isReady(deployment) && isAliasAssigned(deployment)) {
+      debug('Deployment state changed to READY 3');
+      yield { type: 'ready', payload: deployment };
+
+      debug('Deployment alias assigned');
+      return yield { type: 'alias-assigned', payload: deployment };
     }
 
     try {
@@ -219,7 +207,8 @@ export default async function* deploy(
         options.token,
         metadata.version,
         options.teamId,
-        debug
+        debug,
+        options.apiUrl
       )) {
         yield event;
       }
